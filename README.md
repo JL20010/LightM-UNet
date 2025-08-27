@@ -17,7 +17,7 @@ LightM-UNet is a lightweight fusion of UNet and Mamba, boasting a mere parameter
 
 ![result](https://github.com/MrBlankness/LightM-UNet/blob/master/assets/main_result.png)
 
-## Get Start 
+## Get Started 
 
 Requirements: `CUDA ≥ 11.6`
 
