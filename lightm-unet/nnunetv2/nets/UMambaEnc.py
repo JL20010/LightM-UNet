@@ -35,7 +35,8 @@ class MambaLayer(nn.Module):
     
     @autocast(enabled=False)
     def forward(self, x):
-        if x.dtype == torch.float16:
+        input_dtype = x.dtype
+        if input_dtype == torch.float16:
             x = x.type(torch.float32)
         B, C = x.shape[:2]
         assert C == self.dim
@@ -46,7 +47,7 @@ class MambaLayer(nn.Module):
         x_mamba = self.mamba(x_norm)
         out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
 
-        return out
+        return out.type(input_dtype)
 
 
 class ResidualMambaEncoder(nn.Module):

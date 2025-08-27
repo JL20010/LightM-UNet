@@ -39,8 +39,13 @@ class MambaLayer(nn.Module):
         self.skip_scale= nn.Parameter(torch.ones(1))
     
     def forward(self, x):
-        if x.dtype == torch.float16:
+        # remember input dtype so that we can restore it later. The Mamba
+        # implementation operates in fp32 for numerical stability which means
+        # we need to cast back to the original dtype before returning.
+        input_dtype = x.dtype
+        if input_dtype == torch.float16:
             x = x.type(torch.float32)
+
         B, C = x.shape[:2]
         assert C == self.input_dim
         n_tokens = x.shape[2:].numel()
@@ -51,7 +56,8 @@ class MambaLayer(nn.Module):
         x_mamba = self.norm(x_mamba)
         x_mamba = self.proj(x_mamba)
         out = x_mamba.transpose(-1, -2).reshape(B, self.output_dim, *img_dims)
-        return out
+
+        return out.type(input_dtype)
 
 
 def get_mamba_layer(
