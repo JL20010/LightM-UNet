@@ -15,7 +15,9 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 
 def average_probabilities(list_of_files: List[str]) -> np.ndarray:
-    assert len(list_of_files), 'At least one file must be given in list_of_files'
+    num_files = len(list_of_files)
+    assert num_files, 'At least one file must be given in list_of_files'
+    reciprocal_len = 1.0 / num_files
     avg = None
     for f in list_of_files:
         if avg is None:
@@ -25,7 +27,7 @@ def average_probabilities(list_of_files: List[str]) -> np.ndarray:
                 avg = avg.astype(np.float32)
         else:
             avg += np.load(f)['probabilities']
-    avg /= len(list_of_files)
+    avg *= reciprocal_len
     return avg
 
 
