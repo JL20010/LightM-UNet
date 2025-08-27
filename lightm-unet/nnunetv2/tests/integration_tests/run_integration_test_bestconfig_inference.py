@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import torch
 from batchgenerators.utilities.file_and_folder_operations import join, load_pickle
@@ -56,6 +57,8 @@ if __name__ == '__main__':
         predictor = nnUNetPredictor(verbose=False, allow_tqdm=False)
         predictor.initialize_from_trained_model_folder(model_folder, used_folds)
         predictor.predict_from_files(source_dir, output_dir, has_ensemble, overwrite=True)
+        assert any(fname.endswith('.nii.gz') for fname in os.listdir(output_dir)), \
+            f"No segmentation files found in {output_dir}"
         # predict_from_raw_data(list_of_lists_or_source_folder=source_dir, output_folder=output_dir,
         #                       model_training_output_dir=model_folder, use_folds=used_folds,
         #                       save_probabilities=has_ensemble, verbose=False, overwrite=True)
@@ -67,6 +70,9 @@ if __name__ == '__main__':
         folder_for_pp = join(target_dir_base, 'ensemble_predictions')
     else:
         folder_for_pp = output_folders[0]
+
+    assert any(fname.endswith('.nii.gz') for fname in os.listdir(folder_for_pp)), \
+        f"No segmentation files found in {folder_for_pp}"
 
     # apply postprocessing
     pp_fns, pp_fn_kwargs = load_pickle(ret['best_model_or_ensemble']['postprocessing_file'])
