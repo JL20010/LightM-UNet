@@ -4,6 +4,7 @@ import random
 from pathlib import Path
 
 import nibabel as nib
+import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import load_json, save_json
 
 from nnunetv2.dataset_conversion.Dataset027_ACDC import make_out_dirs
@@ -114,8 +115,11 @@ def create_custom_splits(src_data_folder: Path, csv_file: str, dataset_id: int, 
     # Build filenames from corresponding patient frames
     train_a = [f"{patient}_frame{patient_info[patient][frame]:02d}" for patient in train_a for frame in ["es", "ed"]]
     train_b = [f"{patient}_frame{patient_info[patient][frame]:02d}" for patient in train_b for frame in ["es", "ed"]]
-    train_a_mix_1, train_a_mix_2 = train_a[: len(train_a) // 2], train_a[len(train_a) // 2 :]
-    train_b_mix_1, train_b_mix_2 = train_b[: len(train_b) // 2], train_b[len(train_b) // 2 :]
+    inv_two = np.reciprocal(2.0)
+    half_a = int(len(train_a) * inv_two)
+    train_a_mix_1, train_a_mix_2 = train_a[:half_a], train_a[half_a:]
+    half_b = int(len(train_b) * inv_two)
+    train_b_mix_1, train_b_mix_2 = train_b[:half_b], train_b[half_b:]
     val_a = [f"{patient}_frame{patient_info[patient][frame]:02d}" for patient in val_a for frame in ["es", "ed"]]
     val_b = [f"{patient}_frame{patient_info[patient][frame]:02d}" for patient in val_b for frame in ["es", "ed"]]
 

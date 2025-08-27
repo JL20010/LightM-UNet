@@ -9,6 +9,8 @@ from nnunetv2.paths import nnUNet_raw
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 
+ONE_THIRD = np.reciprocal(3.0)
+
 
 def sparsify_segmentation(seg: np.ndarray, label_manager: LabelManager, percent_of_slices: float) -> np.ndarray:
         assert label_manager.has_ignore_label, "This preprocessor only works with datasets that have an ignore label!"
@@ -68,7 +70,7 @@ if __name__ == '__main__':
     for s in segs:
         seg_itk = sitk.ReadImage(s)
         seg_npy = sitk.GetArrayFromImage(seg_itk)
-        seg_npy = sparsify_segmentation(seg_npy, lm, 0.1 / 3)
+        seg_npy = sparsify_segmentation(seg_npy, lm, 0.1 * ONE_THIRD)
         seg_itk_new = sitk.GetImageFromArray(seg_npy)
         seg_itk_new.CopyInformation(seg_itk)
         sitk.WriteImage(seg_itk_new, s)
