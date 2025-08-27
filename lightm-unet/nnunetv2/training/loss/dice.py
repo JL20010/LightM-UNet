@@ -76,7 +76,7 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
         # make everything shape (b, c)
         axes = tuple(range(2, x.ndim))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             if x.ndim != y.ndim:
                 y = y.view((y.shape[0], 1, *y.shape[1:]))
 
@@ -134,7 +134,7 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
     if axes is None:
         axes = tuple(range(2, net_output.ndim))
 
-    with torch.no_grad():
+    with torch.inference_mode():
         if net_output.ndim != gt.ndim:
             gt = gt.view((gt.shape[0], 1, *gt.shape[1:]))
 
@@ -151,7 +151,7 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
     tn = (1 - net_output) * (1 - y_onehot)
 
     if mask is not None:
-        with torch.no_grad():
+        with torch.inference_mode():
             mask_here = torch.tile(mask, (1, tp.shape[1], *[1 for _ in range(2, tp.ndim)]))
         tp *= mask_here
         fp *= mask_here
