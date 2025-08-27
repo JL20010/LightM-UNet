@@ -19,7 +19,7 @@ class nnUNetTrainerCELoss(nnUNetTrainer):
             weights = np.array([1 / (2**i) for i in range(len(deep_supervision_scales))])
             weights[-1] = 0
 
-            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+            # we don't use the lowest output. Normalize weights so that they sum to 1
             weights = weights / weights.sum()
             # now wrap the loss
             loss = DeepSupervisionWrapper(loss, weights)
