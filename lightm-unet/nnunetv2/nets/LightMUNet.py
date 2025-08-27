@@ -17,11 +17,11 @@ from mamba_ssm import Mamba
 def get_dwconv_layer(
     spatial_dims: int, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1, bias: bool = False
 ):
-    depth_conv = Convolution(spatial_dims=spatial_dims, in_channels=in_channels, out_channels=in_channels, 
+    depth_conv = Convolution(spatial_dims=spatial_dims, in_channels=in_channels, out_channels=in_channels,
                              strides=stride, kernel_size=kernel_size, bias=bias, conv_only=True, groups=in_channels)
-    point_conv = Convolution(spatial_dims=spatial_dims, in_channels=in_channels, out_channels=out_channels, 
-                             strides=stride, kernel_size=1, bias=bias, conv_only=True, groups=1)
-    return torch.nn.Sequential(depth_conv, point_conv)
+    point_conv = Convolution(spatial_dims=spatial_dims, in_channels=in_channels, out_channels=out_channels,
+                             strides=1, kernel_size=1, bias=bias, conv_only=True, groups=1)
+    return nn.Sequential(depth_conv, point_conv)
 
 class MambaLayer(nn.Module):
     def __init__(self, input_dim, output_dim, d_state = 16, d_conv = 4, expand = 2):
