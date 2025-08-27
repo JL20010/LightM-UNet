@@ -41,11 +41,13 @@ class ZScoreNormalization(ImageNormalization):
             mask = seg >= 0
             mean = image[mask].mean()
             std = image[mask].std()
-            image[mask] = (image[mask] - mean) / (max(std, 1e-8))
+            std = np.clip(std, 1e-8, None)
+            image[mask] = (image[mask] - mean) * np.reciprocal(std)
         else:
             mean = image.mean()
             std = image.std()
-            image = (image - mean) / (max(std, 1e-8))
+            std = np.clip(std, 1e-8, None)
+            image = (image - mean) * np.reciprocal(std)
         return image
 
 
@@ -60,7 +62,8 @@ class CTNormalization(ImageNormalization):
         lower_bound = self.intensityproperties['percentile_00_5']
         upper_bound = self.intensityproperties['percentile_99_5']
         image = np.clip(image, lower_bound, upper_bound)
-        image = (image - mean_intensity) / max(std_intensity, 1e-8)
+        std_intensity = np.clip(std_intensity, 1e-8, None)
+        image = (image - mean_intensity) * np.reciprocal(std_intensity)
         return image
 
 
@@ -77,7 +80,8 @@ class RescaleTo01Normalization(ImageNormalization):
     def run(self, image: np.ndarray, seg: np.ndarray = None) -> np.ndarray:
         image = image.astype(self.target_dtype)
         image = image - image.min()
-        image = image / np.clip(image.max(), a_min=1e-8, a_max=None)
+        max_val = np.clip(image.max(), a_min=1e-8, a_max=None)
+        image = image * np.reciprocal(max_val)
         return image
 
 
@@ -90,6 +94,7 @@ class RGBTo01Normalization(ImageNormalization):
         assert image.max() <= 255, "RGB images are uint 8, for whatever reason I found pixel values greater than 255" \
                                    ". Your images do not seem to be RGB images"
         image = image.astype(self.target_dtype)
-        image = image / 255.
+        scale = np.reciprocal(np.clip(255., 1e-8, None))
+        image = image * scale
         return image
 
