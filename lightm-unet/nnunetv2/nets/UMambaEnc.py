@@ -21,6 +21,8 @@ from dynamic_network_architectures.initialization.weight_init import init_last_b
 from nnunetv2.utilities.network_initialization import InitWeights_He
 from mamba_ssm import Mamba
 
+INV_16 = np.reciprocal(16.0)
+
 class MambaLayer(nn.Module):
     def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2):
         super().__init__()
@@ -74,7 +76,7 @@ class ResidualMambaEncoder(nn.Module):
                  pool_type: str = 'conv',
                  stochastic_depth_p: float = 0.0,
                  squeeze_excitation: bool = False,
-                 squeeze_excitation_reduction_ratio: float = 1. / 16
+                 squeeze_excitation_reduction_ratio: float = INV_16
                  ):
         super().__init__()
         if isinstance(kernel_sizes, int):
@@ -138,6 +140,7 @@ class ResidualMambaEncoder(nn.Module):
         self.stages = nn.ModuleList(stages)
         self.output_channels = features_per_stage
         self.strides = [maybe_convert_scalar_to_list(conv_op, i) for i in strides]
+        self.stride_reciprocals = [[np.reciprocal(float(j)) for j in stride] for stride in self.strides]
         self.return_skips = return_skips
 
         # we store some things that a potential decoder needs
@@ -176,7 +179,7 @@ class ResidualMambaEncoder(nn.Module):
 
         for s in range(len(self.stages)):
             output += self.stages[s].compute_conv_feature_map_size(input_size)
-            input_size = [i // j for i, j in zip(input_size, self.strides[s])]
+            input_size = [int(i * r) for i, r in zip(input_size, self.stride_reciprocals[s])]
 
         return output
 
@@ -250,6 +253,8 @@ class UNetResDecoder(nn.Module):
         self.stages = nn.ModuleList(stages)
         self.transpconvs = nn.ModuleList(transpconvs)
         self.seg_layers = nn.ModuleList(seg_layers)
+        self.encoder_stride_reciprocals = [[np.reciprocal(float(j)) for j in stride]
+                                           for stride in self.encoder.strides]
 
     def forward(self, skips):
         """
@@ -288,7 +293,7 @@ class UNetResDecoder(nn.Module):
         # least have the size of the skip above that (therefore -1)
         skip_sizes = []
         for s in range(len(self.encoder.strides) - 1):
-            skip_sizes.append([i // j for i, j in zip(input_size, self.encoder.strides[s])])
+            skip_sizes.append([int(i * r) for i, r in zip(input_size, self.encoder_stride_reciprocals[s])])
             input_size = skip_sizes[-1]
         # print(skip_sizes)
 
