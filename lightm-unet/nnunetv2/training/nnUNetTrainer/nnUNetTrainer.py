@@ -57,7 +57,7 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from sklearn.model_selection import KFold
-from torch import autocast, nn
+from torch import autocast, nn, inference_mode
 from torch import distributed as dist
 from torch.cuda import device_count
 from torch.cuda.amp import GradScaler
@@ -157,6 +157,10 @@ class nnUNetTrainer(object):
         self.network = None  # -> self._get_network()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        if self.device.type == 'cuda':
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        self.gradient_accumulation_steps = 1
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -468,8 +472,16 @@ class nnUNetTrainer(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
+        try:
+            optimizer = torch.optim.SGD(
+                self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+                momentum=0.99, nesterov=True, fused=True
+            )
+        except TypeError:
+            optimizer = torch.optim.SGD(
+                self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+                momentum=0.99, nesterov=True
+            )
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         return optimizer, lr_scheduler
 
@@ -880,8 +892,9 @@ class nnUNetTrainer(object):
             f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+        self.log_gpu_memory('train')
 
-    def train_step(self, batch: dict) -> dict:
+    def train_step(self, batch: dict, do_update: bool = True) -> dict:
         data = batch['data']
         target = batch['target']
 
@@ -891,7 +904,7 @@ class nnUNetTrainer(object):
         else:
             target = target.to(self.device, non_blocking=True)
 
-        self.optimizer.zero_grad(set_to_none=True)
+        # zero_grad is managed outside for gradient accumulation
         # Autocast is a little bitch.
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
@@ -903,14 +916,18 @@ class nnUNetTrainer(object):
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+            if do_update:
+                self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
+            if do_update:
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -927,6 +944,7 @@ class nnUNetTrainer(object):
 
     def on_validation_epoch_start(self):
         self.network.eval()
+        self.log_gpu_memory('val')
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -1254,11 +1272,14 @@ class nnUNetTrainer(object):
 
             self.on_train_epoch_start()
             train_outputs = []
+            self.optimizer.zero_grad(set_to_none=True)
             for batch_id in range(self.num_iterations_per_epoch):
-                train_outputs.append(self.train_step(next(self.dataloader_train)))
+                update = ((batch_id + 1) % self.gradient_accumulation_steps == 0) or \
+                         (batch_id + 1 == self.num_iterations_per_epoch)
+                train_outputs.append(self.train_step(next(self.dataloader_train), update))
             self.on_train_epoch_end(train_outputs)
 
-            with torch.no_grad():
+            with inference_mode():
                 self.on_validation_epoch_start()
                 val_outputs = []
                 for batch_id in range(self.num_val_iterations_per_epoch):
@@ -1268,3 +1289,9 @@ class nnUNetTrainer(object):
             self.on_epoch_end()
 
         self.on_train_end()
+
+    def log_gpu_memory(self, tag: str):
+        if self.device.type == 'cuda':
+            allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
+            reserved = torch.cuda.memory_reserved(self.device) / (1024 ** 2)
+            self.print_to_log_file(f"[{tag}] GPU memory allocated: {allocated:.2f}MB; reserved: {reserved:.2f}MB")

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from monai.networks.blocks.convolutions import Convolution
 from monai.networks.blocks.segresnet_block import ResBlock, get_conv_layer, get_upsample_layer
@@ -182,6 +183,7 @@ class LightMUNet(nn.Module):
         blocks_down: tuple = (1, 2, 2, 4),
         blocks_up: tuple = (1, 1, 1),
         upsample_mode: UpsampleMode | str = UpsampleMode.NONTRAINABLE,
+        use_gradient_checkpointing: bool = True,
     ):
         super().__init__()
 
@@ -204,6 +206,7 @@ class LightMUNet(nn.Module):
         self.upsample_mode = UpsampleMode(upsample_mode)
         self.use_conv_final = use_conv_final
         self.convInit = get_dwconv_layer(spatial_dims, in_channels, init_filters)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self.down_layers = self._make_down_layers()
         self.up_layers, self.up_samples = self._make_up_layers()
         self.conv_final = self._make_final_conv(out_channels)
@@ -271,18 +274,19 @@ class LightMUNet(nn.Module):
         down_x = []
 
         for down in self.down_layers:
-            x = down(x)
+            x = checkpoint(down, x) if self.use_gradient_checkpointing else down(x)
             down_x.append(x)
 
         return x, down_x
 
     def decode(self, x: torch.Tensor, down_x: list[torch.Tensor]) -> torch.Tensor:
         for i, (up, upl) in enumerate(zip(self.up_samples, self.up_layers)):
-            x = up(x) + down_x[i + 1]
-            x = upl(x)
+            x = checkpoint(up, x) if self.use_gradient_checkpointing else up(x)
+            x = x + down_x[i + 1]
+            x = checkpoint(upl, x) if self.use_gradient_checkpointing else upl(x)
 
         if self.use_conv_final:
-            x = self.conv_final(x)
+            x = checkpoint(self.conv_final, x) if self.use_gradient_checkpointing else self.conv_final(x)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
