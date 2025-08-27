@@ -79,7 +79,9 @@ def generate_overlay(input_image: np.ndarray, segmentation: np.ndarray, mapping:
 
     # rescale image to [0, 255]
     image = image - image.min()
-    image = image / image.max() * 255
+    img_max = image.max()
+    scale = np.reciprocal(img_max) if img_max != 0 else 0.0
+    image = image * scale * 255
 
     # create output
     if mapping is None:
@@ -90,7 +92,9 @@ def generate_overlay(input_image: np.ndarray, segmentation: np.ndarray, mapping:
         image[segmentation == l] += overlay_intensity * np.array(hex_to_rgb(color_cycle[mapping[l]]))
 
     # rescale result to [0, 255]
-    image = image / image.max() * 255
+    img_max = image.max()
+    scale = np.reciprocal(img_max) if img_max != 0 else 0.0
+    image = image * scale * 255
     return image.astype(np.uint8)
 
 
@@ -122,7 +126,9 @@ def select_slice_to_plot2(image: np.ndarray, segmentation: np.ndarray) -> int:
     for i, c in enumerate(classes):
         fg_mask = segmentation == c
         fg_per_slice[:, i] = fg_mask.sum((1, 2))
-        fg_per_slice[:, i] /= fg_per_slice.sum()
+        den = fg_per_slice.sum()
+        inv_den = np.reciprocal(den) if den != 0 else 0.0
+        fg_per_slice[:, i] *= inv_den
     fg_per_slice = fg_per_slice.mean(1)
     return int(np.argmax(fg_per_slice))
 
