@@ -14,6 +14,8 @@ from monai.utils import UpsampleMode
 
 from mamba_ssm import Mamba
 
+HALF = np.reciprocal(2.0)
+
 
 def get_dwconv_layer(
     spatial_dims: int, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1, bias: bool = False
@@ -219,8 +221,9 @@ class LightMUNet(nn.Module):
         blocks_down, spatial_dims, filters, norm = (self.blocks_down, self.spatial_dims, self.init_filters, self.norm)
         for i, item in enumerate(blocks_down):
             layer_in_channels = filters * 2**i
+            half_layer_in_channels = int(layer_in_channels * HALF)
             downsample_mamba = (
-                get_mamba_layer(spatial_dims, layer_in_channels // 2, layer_in_channels, stride=2)
+                get_mamba_layer(spatial_dims, half_layer_in_channels, layer_in_channels, stride=2)
                 if i > 0
                 else nn.Identity()
             )
@@ -242,10 +245,11 @@ class LightMUNet(nn.Module):
         n_up = len(blocks_up)
         for i in range(n_up):
             sample_in_channels = filters * 2 ** (n_up - i)
+            half_sample_in_channels = int(sample_in_channels * HALF)
             up_layers.append(
                 nn.Sequential(
                     *[
-                        ResUpBlock(spatial_dims, sample_in_channels // 2, norm=norm, act=self.act)
+                        ResUpBlock(spatial_dims, half_sample_in_channels, norm=norm, act=self.act)
                         for _ in range(blocks_up[i])
                     ]
                 )
@@ -253,8 +257,8 @@ class LightMUNet(nn.Module):
             up_samples.append(
                 nn.Sequential(
                     *[
-                        get_conv_layer(spatial_dims, sample_in_channels, sample_in_channels // 2, kernel_size=1),
-                        get_upsample_layer(spatial_dims, sample_in_channels // 2, upsample_mode=upsample_mode),
+                        get_conv_layer(spatial_dims, sample_in_channels, half_sample_in_channels, kernel_size=1),
+                        get_upsample_layer(spatial_dims, half_sample_in_channels, upsample_mode=upsample_mode),
                     ]
                 )
             )

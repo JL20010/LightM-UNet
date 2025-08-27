@@ -89,6 +89,8 @@ class UNetResDecoder(nn.Module):
         self.stages = nn.ModuleList(stages)
         self.transpconvs = nn.ModuleList(transpconvs)
         self.seg_layers = nn.ModuleList(seg_layers)
+        self.encoder_stride_reciprocals = [[np.reciprocal(float(j)) for j in stride]
+                                           for stride in self.encoder.strides]
 
     def forward(self, skips):
         """
@@ -127,7 +129,7 @@ class UNetResDecoder(nn.Module):
         # least have the size of the skip above that (therefore -1)
         skip_sizes = []
         for s in range(len(self.encoder.strides) - 1):
-            skip_sizes.append([i // j for i, j in zip(input_size, self.encoder.strides[s])])
+            skip_sizes.append([int(i * r) for i, r in zip(input_size, self.encoder_stride_reciprocals[s])])
             input_size = skip_sizes[-1]
         # print(skip_sizes)
 
