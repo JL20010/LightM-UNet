@@ -7,10 +7,18 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 class nnUNetTrainerAdam(nnUNetTrainer):
     def configure_optimizers(self):
-        optimizer = AdamW(self.network.parameters(),
-                          lr=self.initial_lr,
-                          weight_decay=self.weight_decay,
-                          amsgrad=True)
+        # Prefer fused AdamW on CUDA if available; fall back gracefully
+        try:
+            optimizer = AdamW(self.network.parameters(),
+                              lr=self.initial_lr,
+                              weight_decay=self.weight_decay,
+                              amsgrad=True,
+                              fused=True)
+        except TypeError:
+            optimizer = AdamW(self.network.parameters(),
+                              lr=self.initial_lr,
+                              weight_decay=self.weight_decay,
+                              amsgrad=True)
         # optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
         #                             momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
@@ -19,9 +27,16 @@ class nnUNetTrainerAdam(nnUNetTrainer):
 
 class nnUNetTrainerVanillaAdam(nnUNetTrainer):
     def configure_optimizers(self):
-        optimizer = Adam(self.network.parameters(),
-                         lr=self.initial_lr,
-                         weight_decay=self.weight_decay)
+        # Prefer fused Adam on CUDA if available; fall back gracefully
+        try:
+            optimizer = Adam(self.network.parameters(),
+                             lr=self.initial_lr,
+                             weight_decay=self.weight_decay,
+                             fused=True)
+        except TypeError:
+            optimizer = Adam(self.network.parameters(),
+                             lr=self.initial_lr,
+                             weight_decay=self.weight_decay)
         # optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
         #                             momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)

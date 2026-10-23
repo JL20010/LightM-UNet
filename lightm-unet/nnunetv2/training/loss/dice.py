@@ -142,7 +142,8 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
             # if this is the case then gt is probably already a one hot encoding
             y_onehot = gt
         else:
-            y_onehot = torch.zeros(net_output.shape, device=net_output.device)
+            # Match one-hot dtype to net_output to avoid unnecessary FP32 buffers
+            y_onehot = torch.zeros(net_output.shape, device=net_output.device, dtype=net_output.dtype)
             y_onehot.scatter_(1, gt.long(), 1)
 
     tp = net_output * y_onehot

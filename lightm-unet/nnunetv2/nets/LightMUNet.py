@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt_utils
 
 from monai.networks.blocks.convolutions import Convolution
 from monai.networks.blocks.segresnet_block import ResBlock, get_conv_layer, get_upsample_layer
@@ -11,7 +12,13 @@ from monai.networks.layers.factories import Dropout
 from monai.networks.layers.utils import get_act_layer, get_norm_layer
 from monai.utils import UpsampleMode
 
-from mamba_ssm import Mamba
+import os
+try:
+    from mamba_ssm import Mamba as _Mamba
+    _HAVE_MAMBA = True
+except Exception as _e:
+    _HAVE_MAMBA = False
+    _Mamba = None
 
 
 def get_dwconv_layer(
@@ -29,12 +36,38 @@ class MambaLayer(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.norm = nn.LayerNorm(input_dim)
-        self.mamba = Mamba(
-                d_model=input_dim, # Model dimension d_model
-                d_state=d_state,  # SSM state expansion factor
-                d_conv=d_conv,    # Local convolution width
-                expand=expand,    # Block expansion factor
-        )
+        # Optional fallback: if Mamba CUDA ops are unavailable OR user requested, allow a safe replacement
+        # by setting LIGHTM_MAMBA_FALLBACK=1. This supports inference portability when CUDA extension is missing.
+        use_fallback_env = os.environ.get('LIGHTM_MAMBA_FALLBACK', '0') in ('1', 'true', 'True')
+        if use_fallback_env:
+            self.mamba = nn.Sequential(
+                nn.Conv1d(input_dim, input_dim * expand, kernel_size=3, padding=1, groups=input_dim),
+                nn.GELU(),
+                nn.Conv1d(input_dim * expand, input_dim, kernel_size=1)
+            )
+            self._using_fallback = True
+        else:
+            if _HAVE_MAMBA:
+                try:
+                    self.mamba = _Mamba(
+                        d_model=input_dim,
+                        d_state=d_state,
+                        d_conv=d_conv,
+                        expand=expand,
+                    )
+                    self._using_fallback = False
+                except Exception as _e_m:
+                    # Strict behavior: if Mamba is installed but kernels are broken, raise
+                    raise ImportError(
+                        f"mamba-ssm is installed but CUDA kernels failed to initialize: {_e_m}. "
+                        "Ensure mamba-ssm is built against the same Torch/CUDA you run with (e.g., rebuild with TORCH_CUDA_ARCH_LIST set)."
+                    )
+            else:
+                raise ImportError(
+                    'mamba_ssm is not available (selective_scan_cuda import failed). '
+                    'Either build mamba-ssm for this Torch/CUDA or set LIGHTM_MAMBA_FALLBACK=1 '
+                    'to use a conv-based fallback for inference.'
+                )
         self.proj = nn.Linear(input_dim, output_dim)
         self.skip_scale= nn.Parameter(torch.ones(1))
     
@@ -47,7 +80,12 @@ class MambaLayer(nn.Module):
         img_dims = x.shape[2:]
         x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
         x_norm = self.norm(x_flat)
-        x_mamba = self.mamba(x_norm) + self.skip_scale * x_flat
+        if getattr(self, '_using_fallback', False):
+            # Conv1d expects (B, C, L)
+            y = self.mamba(x_norm.transpose(-1, -2)).transpose(-1, -2)
+            x_mamba = y + self.skip_scale * x_flat
+        else:
+            x_mamba = self.mamba(x_norm) + self.skip_scale * x_flat
         x_mamba = self.norm(x_mamba)
         x_mamba = self.proj(x_mamba)
         out = x_mamba.transpose(-1, -2).reshape(B, self.output_dim, *img_dims)
@@ -202,8 +240,24 @@ class LightMUNet(nn.Module):
         self.up_layers, self.up_samples = self._make_up_layers()
         self.conv_final = self._make_final_conv(out_channels)
 
+        # Allow toggling activation checkpointing via env for speed vs memory tradeoff
+        try:
+            self.use_activation_checkpoint = os.environ.get('LIGHTM_CKPT', '1').lower() in ('1', 'true', 't')
+        except Exception:
+            self.use_activation_checkpoint = True
+
         if dropout_prob is not None:
             self.dropout = Dropout[Dropout.DROPOUT, spatial_dims](dropout_prob)
+
+    def _ckpt(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        # Apply activation checkpointing during training to save VRAM; can be disabled via env for speed
+        if (not self.training) or (not getattr(self, 'use_activation_checkpoint', True)):
+            return module(x)
+        try:
+            return ckpt_utils.checkpoint(module, x, use_reentrant=False)
+        except TypeError:
+            # Fallback for older PyTorch without use_reentrant
+            return ckpt_utils.checkpoint(module, x)
 
     def _make_down_layers(self):
         down_layers = nn.ModuleList()
@@ -259,13 +313,18 @@ class LightMUNet(nn.Module):
         )
 
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        x = self.convInit(x)
+        # Also checkpoint the initial conv to reduce peak VRAM during forward
+        x = self._ckpt(self.convInit, x)
         if self.dropout_prob is not None:
             x = self.dropout(x)
         down_x = []
 
-        for down in self.down_layers:
-            x = down(x)
+        for i, down in enumerate(self.down_layers):
+            # checkpoint all but the very first stage to save memory
+            if i >= 0:
+                x = self._ckpt(down, x)
+            else:
+                x = down(x)
             down_x.append(x)
 
         return x, down_x
@@ -273,7 +332,7 @@ class LightMUNet(nn.Module):
     def decode(self, x: torch.Tensor, down_x: list[torch.Tensor]) -> torch.Tensor:
         for i, (up, upl) in enumerate(zip(self.up_samples, self.up_layers)):
             x = up(x) + down_x[i + 1]
-            x = upl(x)
+            x = self._ckpt(upl, x)
 
         if self.use_conv_final:
             x = self.conv_final(x)

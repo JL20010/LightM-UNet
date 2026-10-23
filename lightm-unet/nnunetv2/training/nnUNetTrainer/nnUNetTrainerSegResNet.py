@@ -52,6 +52,16 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
         target = batch['target']
 
         data = data.to(self.device, non_blocking=True)
+        # Optional channels_last for conv perf when enabled via env
+        try:
+            import os
+            if os.environ.get('NNUNET_CHANNELS_LAST', '0').lower() in ('1', 'true', 't'):
+                if data.ndim == 4:
+                    data = data.contiguous(memory_format=torch.channels_last)
+                elif data.ndim == 5:
+                    data = data.contiguous(memory_format=getattr(torch, 'channels_last_3d', torch.contiguous_format))
+        except Exception:
+            pass
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -64,7 +74,13 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
         l.backward()
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
         self.optimizer.step()
-        
+        # free intermediates early
+        try:
+            del output
+            del data
+            del target
+        except Exception:
+            pass
         return {'loss': l.detach().cpu().numpy()}
     
 
@@ -73,6 +89,16 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
         target = batch['target']
 
         data = data.to(self.device, non_blocking=True)
+        # Optional channels_last for conv perf when enabled via env
+        try:
+            import os
+            if os.environ.get('NNUNET_CHANNELS_LAST', '0').lower() in ('1', 'true', 't'):
+                if data.ndim == 4:
+                    data = data.contiguous(memory_format=torch.channels_last)
+                elif data.ndim == 5:
+                    data = data.contiguous(memory_format=getattr(torch, 'channels_last_3d', torch.contiguous_format))
+        except Exception:
+            pass
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -80,13 +106,11 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # Autocast is a little bitch.
-        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
-        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-        # So autocast will only be active if we have a cuda device.
-        output = self.network(data)
-        del data
-        l = self.loss(output, target)
+        # Turn off gradients entirely during validation for speed
+        with torch.inference_mode() if hasattr(torch, 'inference_mode') else torch.no_grad():
+            output = self.network(data)
+            del data
+            l = self.loss(output, target)
 
         # the following is needed for online evaluation. Fake dice (green line)
         axes = [0] + list(range(2, output.ndim))
@@ -130,7 +154,11 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
     
     def configure_optimizers(self):
 
-        optimizer = Adam(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay, eps=1e-5)
+        # Prefer fused Adam on CUDA if available; fall back gracefully
+        try:
+            optimizer = Adam(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay, eps=1e-5, fused=True)
+        except TypeError:
+            optimizer = Adam(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay, eps=1e-5)
         scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs, exponent=0.9)
 
         return optimizer, scheduler

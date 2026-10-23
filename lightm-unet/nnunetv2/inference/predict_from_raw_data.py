@@ -2,12 +2,34 @@ import inspect
 import itertools
 import multiprocessing
 import os
+import subprocess
 import traceback
 from copy import deepcopy
 from time import sleep
 from typing import Tuple, Union, List, Optional
 
 import numpy as np
+# Prevent user site-packages (e.g., ~/.local) from shadowing the env, which can mix Torch versions
+try:
+    if os.environ.get('PYTHONNOUSERSITE') != '1':
+        import sys as _sys, site as _site
+        _paths = []
+        try:
+            up = _site.getusersitepackages()
+            _paths.extend(up if isinstance(up, list) else [up])
+        except Exception:
+            pass
+        try:
+            sp = _site.getsitepackages()
+            # do not remove env sitepackages, only user site paths
+        except Exception:
+            pass
+        for p in list(_paths):
+            if p in _sys.path:
+                _sys.path.remove(p)
+        os.environ['PYTHONNOUSERSITE'] = '1'
+except Exception:
+    pass
 import torch
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
@@ -33,6 +55,7 @@ from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
+from nnunetv2.utilities.perf import enable_tf32, preload_torch_cuda_libs
 
 
 class nnUNetPredictor(object):
@@ -62,6 +85,11 @@ class nnUNetPredictor(object):
         if device.type != 'cuda':
             print(f'perform_everything_on_device=True is only supported for cuda devices! Setting this to False')
             perform_everything_on_device = False
+        # Small, safe speed tweak for GPU matmuls
+        try:
+            enable_tf32()
+        except Exception:
+            pass
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
 
@@ -71,6 +99,27 @@ class nnUNetPredictor(object):
         """
         This is used when making predictions with a trained model
         """
+        # Lightweight, portable preflight for mamba_ssm CUDA extension.
+        # If the CUDA op is not available, enable the conv fallback for inference
+        # instead of attempting to build wheels at runtime.
+        _use_fallback = os.environ.get('LIGHTM_MAMBA_FALLBACK', '0') in ('1', 'true', 'True')
+        if not _use_fallback:
+            try:
+                try:
+                    preload_torch_cuda_libs()
+                except Exception:
+                    pass
+                import selective_scan_cuda as _ssc  # noqa: F401
+                _ok = hasattr(_ssc, 'fwd') or hasattr(_ssc, 'selective_scan_fn')
+                if not _ok:
+                    raise ImportError('selective_scan_cuda missing expected symbols')
+            except Exception as e_pre:
+                raise RuntimeError(
+                    'Mamba CUDA extension is not importable. For exact Mamba behavior, ensure a consistent Torch/CUDA '
+                    'installation and that mamba-ssm is built against it. Tip: set PYTHONNOUSERSITE=1 to avoid user-site '
+                    'packages shadowing your env, and rebuild mamba-ssm with TORCH_CUDA_ARCH_LIST (e.g., 8.9 for 4070). '
+                    f'Underlying error: {e_pre}'
+                )
         if use_folds is None:
             use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
@@ -84,8 +133,14 @@ class nnUNetPredictor(object):
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                    map_location=torch.device('cpu'))
+            ckpt_path = join(model_training_output_dir, f'fold_{f}', checkpoint_name)
+            try:
+                # PyTorch >= 2.6 defaults weights_only=True which breaks older checkpoints.
+                # Our checkpoints are locally trained/trusted, so load full state.
+                checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=False)
+            except TypeError:
+                # Older torch versions do not support weights_only argument
+                checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'))
             if i == 0:
                 trainer_name = checkpoint['trainer_name']
                 configuration_name = checkpoint['init_args']['configuration']
@@ -462,10 +517,19 @@ class nnUNetPredictor(object):
             for params in self.list_of_parameters:
 
                 # messing with state dict names...
+                use_fallback = os.environ.get('LIGHTM_MAMBA_FALLBACK', '0') in ('1', 'true', 'True')
+                strict_load = not use_fallback
                 if not isinstance(self.network, OptimizedModule):
-                    self.network.load_state_dict(params)
+                    try:
+                        self.network.load_state_dict(params, strict=strict_load)
+                    except TypeError:
+                        # older torch may not support named arg
+                        self.network.load_state_dict(params)
                 else:
-                    self.network._orig_mod.load_state_dict(params)
+                    try:
+                        self.network._orig_mod.load_state_dict(params, strict=strict_load)
+                    except TypeError:
+                        self.network._orig_mod.load_state_dict(params)
 
                 # why not leave prediction on device if perform_everything_on_device? Because this may cause the
                 # second iteration to crash due to OOM. Grabbing tha twith try except cause way more bloated code than
@@ -519,6 +583,11 @@ class nnUNetPredictor(object):
 
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+        # prefer channels-last tensors for conv perf
+        if x.ndim == 4:
+            x = x.contiguous(memory_format=torch.channels_last)
+        elif x.ndim == 5:
+            x = x.contiguous(memory_format=getattr(torch, 'channels_last_3d', torch.contiguous_format))
         prediction = self.network(x)
 
         if mirror_axes is not None:
@@ -546,24 +615,35 @@ class nnUNetPredictor(object):
         if self.verbose:
             print(f'move image to device {results_device}')
         data = data.to(results_device)
+        if data.ndim == 4:
+            data = data.contiguous(memory_format=torch.channels_last)
+        elif data.ndim == 5:
+            data = data.contiguous(memory_format=getattr(torch, 'channels_last_3d', torch.contiguous_format))
 
         # preallocate arrays
         if self.verbose:
             print(f'preallocating results arrays on device {results_device}')
+        # Accumulate logits in float32 for numerical fidelity
         predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
-                                       dtype=torch.half,
+                                       dtype=torch.float32,
                                        device=results_device)
-        n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+        n_predictions = torch.zeros(data.shape[1:], dtype=torch.float32, device=results_device)
         if self.use_gaussian:
             gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
                                         value_scaling_factor=10,
+                                        dtype=torch.float32,
                                         device=results_device)
 
         if self.verbose: print('running prediction')
         if not self.allow_tqdm and self.verbose: print(f'{len(slicers)} steps')
         for sl in tqdm(slicers, disable=not self.allow_tqdm):
             workon = data[sl][None]
-            workon = workon.to(self.device, non_blocking=False)
+            # prefer non_blocking H2D if pinned memory is used (no-op otherwise)
+            workon = workon.to(self.device, non_blocking=True)
+            if workon.ndim == 4:
+                workon = workon.contiguous(memory_format=torch.channels_last)
+            elif workon.ndim == 5:
+                workon = workon.contiguous(memory_format=getattr(torch, 'channels_last_3d', torch.contiguous_format))
 
             prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
 
@@ -593,7 +673,6 @@ class nnUNetPredictor(object):
         # is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with torch.no_grad():
-            with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
                 assert input_image.ndim == 4, 'input_image must be a 4D np.ndarray or torch.Tensor (c, x, y, z)'
 
                 if self.verbose: print(f'Input shape: {input_image.shape}')
@@ -705,7 +784,7 @@ def predict_entry_point_modelfolder():
     predictor = nnUNetPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
-                                perform_everything_on_device=True,
+                                perform_everything_on_device=False,
                                 device=device,
                                 verbose=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar)
@@ -908,4 +987,3 @@ if __name__ == '__main__':
     #                              num_processes_preprocessing=2, num_processes_segmentation_export=2,
     #                              folder_with_segs_from_prev_stage='/media/isensee/data/nnUNet_raw/Dataset003_Liver/imagesTs_predlowres',
     #                              num_parts=1, part_id=0)
-

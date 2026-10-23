@@ -63,6 +63,16 @@ class nnUNetTrainerUNETR(nnUNetTrainerNoDeepSupervision):
         target = batch['target']
 
         data = data.to(self.device, non_blocking=True)
+        # Optional channels_last for conv perf when enabled via env
+        try:
+            import os, torch as _t
+            if os.environ.get('NNUNET_CHANNELS_LAST', '0').lower() in ('1', 'true', 't'):
+                if data.ndim == 4:
+                    data = data.contiguous(memory_format=_t.channels_last)
+                elif data.ndim == 5:
+                    data = data.contiguous(memory_format=getattr(_t, 'channels_last_3d', _t.contiguous_format))
+        except Exception:
+            pass
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -75,7 +85,13 @@ class nnUNetTrainerUNETR(nnUNetTrainerNoDeepSupervision):
         l.backward()
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
         self.optimizer.step()
-        
+        # early frees
+        try:
+            del output
+            del data
+            del target
+        except Exception:
+            pass
         return {'loss': l.detach().cpu().numpy()}
     
 
@@ -84,16 +100,27 @@ class nnUNetTrainerUNETR(nnUNetTrainerNoDeepSupervision):
         target = batch['target']
 
         data = data.to(self.device, non_blocking=True)
+        # Optional channels_last for conv perf when enabled via env
+        try:
+            import os, torch as _t
+            if os.environ.get('NNUNET_CHANNELS_LAST', '0').lower() in ('1', 'true', 't'):
+                if data.ndim == 4:
+                    data = data.contiguous(memory_format=_t.channels_last)
+                elif data.ndim == 5:
+                    data = data.contiguous(memory_format=getattr(_t, 'channels_last_3d', _t.contiguous_format))
+        except Exception:
+            pass
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
-
-        output = self.network(data)
-        del data
-        l = self.loss(output, target)
+        # No grads for validation forward path
+        with torch.inference_mode() if hasattr(torch, 'inference_mode') else torch.no_grad():
+            output = self.network(data)
+            del data
+            l = self.loss(output, target)
 
         # the following is needed for online evaluation. Fake dice (green line)
         axes = [0] + list(range(2, output.ndim))
@@ -137,7 +164,11 @@ class nnUNetTrainerUNETR(nnUNetTrainerNoDeepSupervision):
     
     def configure_optimizers(self):
 
-        optimizer = AdamW(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay, eps=1e-5)
+        # Prefer fused AdamW on CUDA if available; fall back gracefully
+        try:
+            optimizer = AdamW(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay, eps=1e-5, fused=True)
+        except TypeError:
+            optimizer = AdamW(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay, eps=1e-5)
         scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs, exponent=1.0)
 
         self.print_to_log_file(f"Using optimizer {optimizer}")
