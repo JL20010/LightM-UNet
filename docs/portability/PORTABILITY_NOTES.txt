@@ -1,0 +1,57 @@
+Purpose: capture why and how to migrate away from nnU-Net scaffolding when porting LightM-UNet to other projects (e.g., dark-matter sky images), while preserving a minimal path to run LightM-UNet today.
+
+Why move beyond nnU-Net (for portability)
+- Dataset format lock-in: nnU-Net expects a rigid folder layout (nnUNet_raw/nnUNet_preprocessed), a specific DatasetXXX_Name naming scheme, and a dataset.json. Porting arbitrary science data usually needs custom loaders, tiling, and metadata handling that don’t naturally fit the medical format.
+- Pipeline coupling: planning, preprocessing, augmentation, patch sizes, and trainer lifecycle are tied to nnU-Net’s “plans” and CLI. That’s convenient short-term but constrains experimentation and integration into non-nnU-Net codebases.
+- Heavy dependencies: batchgenerators, dynamic_network_architectures, and nnU-Net-specific utilities increase the dependency footprint and friction on HPC/cluster environments that favor lean environments.
+- Operational simplicity: for deployment and research beyond medical imaging, a small PyTorch module + dataloader + inference-tiling loop is easier to maintain, package, and run in diverse environments (bare PyTorch/MONAI, Slurm, Kubernetes, notebooks, etc.).
+- Checkpoint/control: direct control over mixed precision, gradient accumulation, custom losses/metrics (e.g., PR-AUC for rare targets), and long-range validation logic is simpler outside the nnU-Net training harness.
+- Build constraints: mamba-ssm CUDA ops may need compiling per Torch/CUDA. While this repo’s trainer preflights/rebuilds them, a pure-model path can opt into a conv fallback or make that choice per deployment, independently of nnU-Net’s expectations.
+
+When to keep nnU-Net
+- You rely on its automated planning, 5-fold cross-val conventions, ensembling, and post-processing.
+- Your data and workflows fit the nnU-Net directory and JSON schema with little extra work.
+
+Pure LightM-UNet path (portable skeleton)
+1) Model import
+   - from nnunetv2.nets.LightMUNet import LightMUNet
+   - model = LightMUNet(spatial_dims=2 or 3, in_channels=NUM_BANDS, out_channels=NUM_CLASSES, init_filters=32)
+   - Optional portability: set LIGHTM_MAMBA_FALLBACK=1 before importing to use a conv-based fallback when mamba-ssm kernels are unavailable.
+2) Data loading/tiling
+   - Implement a Dataset that yields (C,H,W)/(C,D,H,W) tensors; normalize bands; tile large frames (e.g., 512–768 tiles with overlap); stitch at inference via weighted blending.
+3) Transforms/augs
+   - Use MONAI or torchvision transforms (flips, scale/crop, intensity norm). Keep labels binary/multi-class as required.
+4) Losses
+   - Binary: Dice + BCE or Focal. Multi-class: DiceCE. Handle class imbalance explicitly (weights, focal gamma).
+5) Optimizer/scheduler
+   - Adam/AdamW with lr≈1e-4, weight_decay≈1e-5; PolyLR or CosineAnnealing. Clip grads (norm≈12).
+6) Training loop
+   - Channels-last inputs (contiguous to channels_last), torch.autocast(dtype=bfloat16 on CUDA), torch.inference_mode for val, gradient checkpointing already inside LightMUNet (saves VRAM).
+   - Save checkpoints (best/last), log metrics (Dice, IoU, PR-AUC for rare targets), track VRAM/throughput.
+7) Inference
+   - Sliding window over large images, overlap 0.25–0.5, mean/gaussian blending; threshold or argmax to masks; save PNG/NIIfTI as needed.
+8) Multi-GPU
+   - Optional DDP (torchrun) with proper seeding and synchronized metrics.
+9) Packaging
+   - Minimal requirements: torch, monai (optional), numpy, pillow. mamba-ssm (optional, if not using fallback).
+
+Minimal training sketch (pseudo):
+  model = LightMUNet(spatial_dims=2, in_channels=C, out_channels=K, init_filters=32).cuda()
+  opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+  for epoch in range(E):
+      model.train()
+      for x,y in train_loader:
+          x,y = x.cuda(non_blocking=True), y.cuda(non_blocking=True)
+          x = x.contiguous(memory_format=torch.channels_last)
+          with torch.autocast('cuda', dtype=torch.bfloat16):
+              pred = model(x)
+              loss = dice_ce_or_focal(pred, y)
+          opt.zero_grad(set_to_none=True)
+          loss.backward()
+          torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
+          opt.step()
+      validate(...)
+
+Outcome
+- You retain a simple, dependency-light LightM-UNet that can be embedded into any astronomy/physics pipeline while still using the nnU-Net path for quick baselines today.
+
